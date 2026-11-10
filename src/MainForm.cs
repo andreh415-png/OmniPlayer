@@ -136,8 +136,8 @@ sealed class MainForm : Form
         var startup = args.Where(a => IsUrl(a) || File.Exists(a) || Directory.Exists(a)).ToList();
         Shown += (s, e) =>
         {
-            try { split.SplitterDistance = Math.Max(300, split.Width - S.PlaylistWidth); } catch { }
             if (S.Maximized) WindowState = FormWindowState.Maximized;
+            ApplySplit();
             RenderList(true);
             if (startup.Count > 0) AddPaths(startup);
             else if (queued != null) Status($"Press Space to continue: {queued.Name}", 8000);
@@ -199,7 +199,7 @@ sealed class MainForm : Form
 
         split = new SplitContainer
         {
-            Dock = DockStyle.Fill, FixedPanel = FixedPanel.Panel2, BackColor = Theme.Line, SplitterWidth = 4, Panel2MinSize = 220, TabStop = false
+            Dock = DockStyle.Fill, FixedPanel = FixedPanel.Panel2, BackColor = Theme.Line, SplitterWidth = 4, TabStop = false, Size = new Size(1200, 640)
         };
         split.Panel1.BackColor = Color.Black;
         split.Panel2.BackColor = Theme.Panel;
@@ -1154,6 +1154,20 @@ sealed class MainForm : Form
 
     // ───────────────────────────── Window / view ─────────────────────────────
 
+    /// <summary>Sets playlist width/min sizes once the window has its real size (doing it earlier throws).</summary>
+    void ApplySplit()
+    {
+        try
+        {
+            int w = split.Width;
+            if (w < 600) return;
+            split.Panel1MinSize = 300;
+            split.Panel2MinSize = 220;
+            split.SplitterDistance = Math.Clamp(w - S.PlaylistWidth, 300, w - 220 - split.SplitterWidth);
+        }
+        catch (Exception ex) { Log.Write("Split layout: " + ex.Message); }
+    }
+
     void TogglePlaylist()
     {
         S.ShowPlaylist = !S.ShowPlaylist;
@@ -1275,7 +1289,7 @@ sealed class MainForm : Form
         S = new Settings { Positions = keep };
         eqForm?.Dispose(); eqForm = null;
         ApplySettings();
-        try { split.SplitterDistance = Math.Max(300, split.Width - S.PlaylistWidth); } catch { }
+        ApplySplit();
         Status("Settings reset to defaults");
     }
 
