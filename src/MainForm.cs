@@ -73,18 +73,14 @@ sealed class MainForm : Form, IMessageFilter
     Font iconFont, iconFontBig, smallBold, boldFont;
     readonly System.Windows.Forms.Timer ui = new() { Interval = 200 };
     readonly System.Windows.Forms.Timer clickTimer = new();
-    readonly System.Windows.Forms.Timer zoomTimer = new() { Interval = 40 };
 
-    // Zoom & pan (picture-viewer style). Implemented with libVLC crop geometry, so it costs nothing extra to decode.
-    float zoom = 1f, zcx = 0.5f, zcy = 0.5f, panCx, panCy;
-    bool cropDirty, mouseDown, panned;
-    // Picture geometry for zoom: libVLC crops in the STORED frame, before applying rotation
-    // (phone videos are usually stored sideways with a rotate flag), so we track both.
-    uint srcW, srcH;       // stored frame size in pixels
-    int orient;            // libVLC orientation: 0 normal … 5 = rotated 270°, 6 = rotated 90°
-    float dispAspect;      // width/height of the picture as shown (after rotation and pixel aspect)
-    bool geoKnown;
-    Point downPt;
+    // Zoom & pan, photo-viewer style: the video surface is made bigger than the area showing it and slid around
+    // inside it; the window clips the rest. Nothing is cropped, so rotation or aspect can never squash the picture.
+    const int MaxSurface = 8192;          // largest video surface (pixels) — keeps GPU memory sane
+    float zoom = 1f, zcx = 0.5f, zcy = 0.5f, panCx, panCy;   // zcx/zcy = picture point shown at the view's centre
+    bool mouseDown, panned, geoKnown;
+    Point downScreen;
+    float dispAspect;                     // picture width / height as shown
 
     // State
     readonly List<Item> items = new();
@@ -183,7 +179,7 @@ sealed class MainForm : Form, IMessageFilter
     {
         // Video area
         videoHost = new Panel { Dock = DockStyle.Fill, BackColor = Color.Black };
-        video = new VideoView { Dock = DockStyle.Fill, BackColor = Color.Black, MediaPlayer = mp };
+        video = new VideoView { BackColor = Color.Black, MediaPlayer = mp };
         placeholder = new Label
         {
             Dock = DockStyle.Fill, BackColor = Color.Black, ForeColor = Theme.Muted, TextAlign = ContentAlignment.MiddleCenter,
@@ -192,6 +188,7 @@ sealed class MainForm : Form, IMessageFilter
         };
         videoHost.Controls.Add(video);
         videoHost.Controls.Add(placeholder);
+        videoHost.Resize += (s, e) => LayoutVideo();
         placeholder.BringToFront();
 
         // Playlist
@@ -318,10 +315,10 @@ sealed class MainForm : Form, IMessageFilter
         var m = new ToolStripMenuItem("Aspect Ratio");
         foreach (var (label, value) in Aspects)
         {
-            var v = value; var mi = MI(label, "", () => { mp.AspectRatio = v; Status("Aspect ratio: " + (v ?? "default")); });
+            var v = value; var mi = MI(label, "", () => { mp.AspectRatio = v; InvalidateZoom(); Status("Aspect ratio: " + (v ?? "default")); });
             m.DropDownItems.Add(mi);
         }
-        m.DropDownItems.Add(MI("Stretch to window", "", () => { mp.AspectRatio = $"{video.Width}:{Math.Max(1, video.Height)}"; Status("Stretched to window"); }));
+        m.DropDownItems.Add(MI("Stretch to window", "", () => { mp.AspectRatio = $"{videoHost.Width}:{Math.Max(1, videoHost.Height)}"; InvalidateZoom(); Status("Stretched to window"); }));
         m.DropDownOpening += (s, e) =>
         {
             string ar = null; try { ar = mp.AspectRatio; } catch { }
@@ -484,30 +481,27 @@ sealed class MainForm : Form, IMessageFilter
         {
             if (e.Button == MouseButtons.Middle) { ResetZoom(); return; }
             if (e.Button != MouseButtons.Left) return;
-            mouseDown = true; panned = false; downPt = e.Location; panCx = zcx; panCy = zcy;
+            mouseDown = true; panned = false; downScreen = Cursor.Position; panCx = zcx; panCy = zcy;
         };
         video.MouseMove += (s, e) =>
         {
-            if (!mouseDown || zoom <= 1f) return;
-            int dx = e.X - downPt.X, dy = e.Y - downPt.Y;
+            if (!mouseDown || zoom <= 1.001f) return;
+            var pt = Cursor.Position;   // screen coordinates: the surface itself moves while dragging
+            int dx = pt.X - downScreen.X, dy = pt.Y - downScreen.Y;
             if (!panned && Math.Abs(dx) + Math.Abs(dy) < 5) return;
-            if (!Geometry()) return;
             panned = true;
-            var r = DisplayRect();
-            zcx = panCx - dx / r.Width / zoom;
-            zcy = panCy - dy / r.Height / zoom;
-            ClampCenter();
-            cropDirty = true;
+            var r = PicRect();
+            zcx = panCx - dx / (r.Width * zoom);
+            zcy = panCy - dy / (r.Height * zoom);
+            LayoutVideo();
         };
         video.MouseUp += (s, e) =>
         {
             if (e.Button != MouseButtons.Left || !mouseDown) return;
             mouseDown = false;
-            if (panned) { panned = false; ApplyCrop(); return; }
+            if (panned) { panned = false; return; }
             clickTimer.Stop(); clickTimer.Start();
         };
-        zoomTimer.Tick += (s, e) => { if (cropDirty) { cropDirty = false; ApplyCrop(); } };
-        zoomTimer.Start();
         Application.AddMessageFilter(this);
         video.MouseDoubleClick += (s, e) => { if (e.Button == MouseButtons.Left) { clickTimer.Stop(); ToggleFullscreen(); } };
         placeholder.Click += (s, e) => { if (items.Count == 0) OpenFiles(); else TogglePlay(); };
@@ -836,8 +830,8 @@ sealed class MainForm : Form, IMessageFilter
         var prev = cur;
         cur = it; queued = null;
         abA = abB = -1; resumePending = true; lastSpu = -1;
-        zoom = 1f; zcx = zcy = 0.5f; cropDirty = false; geoKnown = false; video.Cursor = Cursors.Default;
-        try { mp.CropGeometry = null; } catch { }
+        zoom = 1f; zcx = zcy = 0.5f; geoKnown = false;
+        LayoutVideo();
         Media media;
         try
         {
@@ -1438,7 +1432,7 @@ VIDEO & SUBTITLES
   F / F11 / dbl-click  Fullscreen   (Esc exits)
   C                  Subtitles on / off
   G / H              Subtitle delay −/+ 100 ms
-  Mouse wheel        Zoom in / out at the cursor (up to 10×)
+  Mouse wheel        Zoom in / out at the cursor (up to 10× on most videos)
   Drag (zoomed)      Move around the zoomed picture
   Ctrl + = / −       Zoom in / out      Z or middle-click  Reset zoom
   Shift + S          Snapshot → Pictures\OmniPlayer
@@ -1608,13 +1602,26 @@ libVLC is licensed under the LGPL 2.1.");
 
     // ───────────────────────────── Zoom & pan ─────────────────────────────
 
-    /// <summary>Reads the stored frame size, pixel aspect and rotation of the playing video.</summary>
+    /// <summary>Works out the picture's shape as shown (after rotation, pixel aspect and any aspect-ratio override).</summary>
     bool Geometry()
     {
         if (geoKnown) return true;
         if (cur == null) return false;
         try
         {
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            string ar = mp.AspectRatio;
+            if (!string.IsNullOrEmpty(ar))
+            {
+                var parts = ar.Split(':');
+                if (parts.Length == 2 && float.TryParse(parts[0], System.Globalization.NumberStyles.Float, inv, out var a) &&
+                    float.TryParse(parts[1], System.Globalization.NumberStyles.Float, inv, out var b) && a > 0 && b > 0)
+                {
+                    dispAspect = a / b; geoKnown = true;
+                    Log.Write($"Zoom: aspect override {ar} → {dispAspect:0.###}");
+                    return true;
+                }
+            }
             var media = mp.Media;
             if (media != null)
             {
@@ -1628,22 +1635,19 @@ libVLC is licensed under the LGPL 2.1.");
                 if (pick is MediaTrack vt)
                 {
                     var v = vt.Data.Video;
-                    srcW = v.Width; srcH = v.Height; orient = (int)v.Orientation;
                     double sar = v.SarNum > 0 && v.SarDen > 0 ? (double)v.SarNum / v.SarDen : 1.0;
-                    double dw = srcW * sar, dh = srcH;
-                    if (orient >= 4) (dw, dh) = (dh, dw);           // 90°/270°/transposed: width and height swap
-                    dispAspect = (float)(dw / dh);
-                    geoKnown = true;
-                    Log.Write($"Zoom geometry: stored {srcW}x{srcH}, pixel aspect {sar:0.###}, orientation {orient}, shown aspect {dispAspect:0.###}");
+                    double dw = v.Width * sar, dh = v.Height;
+                    if ((int)v.Orientation >= 4) (dw, dh) = (dh, dw);   // stored sideways (phone video): width/height swap
+                    dispAspect = (float)(dw / dh); geoKnown = true;
+                    Log.Write($"Zoom: video {v.Width}x{v.Height}, pixel aspect {sar:0.###}, orientation {(int)v.Orientation} → shown aspect {dispAspect:0.###}");
                     return true;
                 }
             }
-            // Fallback when track info isn't available: measure the un-cropped picture.
             uint w = 0, h = 0;
-            if (zoom <= 1.001f && mp.Size(0, ref w, ref h) && w > 0 && h > 0)
+            if (mp.Size(0, ref w, ref h) && w > 0 && h > 0)
             {
-                srcW = w; srcH = h; orient = 0; dispAspect = w / (float)h; geoKnown = true;
-                Log.Write($"Zoom geometry (fallback): {w}x{h}");
+                dispAspect = w / (float)h; geoKnown = true;
+                Log.Write($"Zoom: measured {w}x{h}");
                 return true;
             }
         }
@@ -1651,80 +1655,82 @@ libVLC is licensed under the LGPL 2.1.");
         return false;
     }
 
-    /// <summary>Where the (letterboxed) picture sits inside the video panel.</summary>
-    RectangleF DisplayRect()
+    /// <summary>Where the whole picture sits in the video area at normal size (letterboxed).</summary>
+    RectangleF PicRect()
     {
-        float vw = Math.Max(1, video.Width), vh = Math.Max(1, video.Height);
-        float dw, dh;
-        if (vw / vh > dispAspect) { dh = vh; dw = vh * dispAspect; } else { dw = vw; dh = vw / dispAspect; }
-        return new RectangleF((vw - dw) / 2, (vh - dh) / 2, dw, dh);
+        float hw = Math.Max(1, videoHost.ClientSize.Width), hh = Math.Max(1, videoHost.ClientSize.Height);
+        if (!Geometry() || dispAspect <= 0) return new RectangleF(0, 0, hw, hh);
+        float w, h;
+        if (hw / hh > dispAspect) { h = hh; w = hh * dispAspect; } else { w = hw; h = hw / dispAspect; }
+        return new RectangleF((hw - w) / 2, (hh - h) / 2, w, h);
     }
 
-    /// <summary>Maps a point on the picture as shown (0–1) to the stored, un-rotated frame (0–1).</summary>
-    static (float x, float y) ToStored(float u, float v, int o) => o switch
+    float MaxZoom()
     {
-        1 => (1 - u, v),          // mirrored horizontally
-        2 => (u, 1 - v),          // mirrored vertically
-        3 => (1 - u, 1 - v),      // rotated 180°
-        4 => (v, u),              // transposed
-        5 => (1 - v, u),          // rotated 270° (90° counter-clockwise)
-        6 => (v, 1 - u),          // rotated 90° clockwise (typical portrait phone video)
-        7 => (1 - v, 1 - u),      // anti-transposed
-        _ => (u, v)
-    };
-
-    void ClampCenter()
-    {
-        float half = 0.5f / zoom;
-        zcx = Math.Clamp(zcx, half, 1 - half);
-        zcy = Math.Clamp(zcy, half, 1 - half);
+        var r = PicRect();
+        return Math.Max(1f, Math.Min(10f, MaxSurface / Math.Max(r.Width, r.Height)));
     }
 
-    void ApplyCrop()
+    /// <summary>Sizes and places the video surface for the current zoom; the video area clips what's outside it.</summary>
+    void LayoutVideo()
     {
-        try
+        if (video == null || videoHost == null) return;
+        var host = videoHost.ClientSize;
+        if (zoom <= 1.001f)
         {
-            if (zoom <= 1.001f) { zoom = 1f; zcx = zcy = 0.5f; mp.CropGeometry = null; video.Cursor = Cursors.Default; return; }
-            if (!Geometry()) return;
-            ClampCenter();
-            float half = 0.5f / zoom;
-            var a = ToStored(zcx - half, zcy - half, orient);
-            var b = ToStored(zcx + half, zcy + half, orient);
-            float x0 = Math.Min(a.x, b.x), x1 = Math.Max(a.x, b.x), y0 = Math.Min(a.y, b.y), y1 = Math.Max(a.y, b.y);
-            int cw = Math.Max(16, (int)Math.Round((x1 - x0) * srcW));
-            int ch = Math.Max(16, (int)Math.Round((y1 - y0) * srcH));
-            int x = Math.Clamp((int)Math.Round(x0 * srcW), 0, (int)srcW - cw);
-            int y = Math.Clamp((int)Math.Round(y0 * srcH), 0, (int)srcH - ch);
-            string geo = $"{cw}x{ch}+{x}+{y}";
-            mp.CropGeometry = geo;
-            Log.Write($"Zoom {zoom:0.00}x → crop {geo}");
-            video.Cursor = Cursors.SizeAll;
+            zoom = 1f; zcx = zcy = 0.5f;
+            var full = new Rectangle(Point.Empty, host);
+            if (video.Bounds != full) video.Bounds = full;
+            if (video.Cursor != Cursors.Default) video.Cursor = Cursors.Default;
+            return;
         }
-        catch (Exception ex) { Log.Write("Zoom: " + ex.Message); }
+        zoom = Math.Min(zoom, MaxZoom());
+        var p = PicRect();
+        float w = p.Width * zoom, h = p.Height * zoom;
+        float x = Place(host.Width, w, ref zcx), y = Place(host.Height, h, ref zcy);
+        var nb = new Rectangle((int)Math.Round(x), (int)Math.Round(y), (int)Math.Round(w), (int)Math.Round(h));
+        if (video.Bounds != nb) video.Bounds = nb;
+        if (video.Cursor != Cursors.SizeAll) video.Cursor = Cursors.SizeAll;
     }
 
-    /// <summary>Zooms by <paramref name="factor"/> keeping the point under <paramref name="at"/> fixed, like a photo viewer.</summary>
-    void ZoomAt(float factor, Point at)
+    /// <summary>Position on one axis: centred when the zoomed picture is smaller than the view, otherwise clamped so no gap shows.</summary>
+    static float Place(float view, float size, ref float c)
+    {
+        if (size <= view) { c = 0.5f; return (view - size) / 2; }
+        float pos = Math.Clamp(view / 2 - c * size, view - size, 0);
+        c = (view / 2 - pos) / size;
+        return pos;
+    }
+
+    /// <summary>Zooms by <paramref name="factor"/> keeping the spot under <paramref name="hostPt"/> still, like a photo viewer.</summary>
+    void ZoomAt(float factor, Point hostPt)
     {
         if (!Geometry()) { Status("Zoom works on videos"); return; }
-        ClampCenter();
-        var r = DisplayRect();
-        float fx = Math.Clamp((at.X - r.X) / r.Width, 0, 1), fy = Math.Clamp((at.Y - r.Y) / r.Height, 0, 1);
-        float px = zcx - 0.5f / zoom + fx / zoom, py = zcy - 0.5f / zoom + fy / zoom;   // picture point under the cursor
-        zoom = Math.Clamp(zoom * factor, 1f, 10f);
-        zcx = px - fx / zoom + 0.5f / zoom;
-        zcy = py - fy / zoom + 0.5f / zoom;
-        ApplyCrop();
+        var p = PicRect();
+        RectangleF shown = zoom <= 1.001f ? p : new RectangleF(video.Left, video.Top, video.Width, video.Height);
+        float fx = Math.Clamp((hostPt.X - shown.X) / shown.Width, 0, 1);
+        float fy = Math.Clamp((hostPt.Y - shown.Y) / shown.Height, 0, 1);
+        float max = MaxZoom();
+        float nz = Math.Clamp(zoom * factor, 1f, max);
+        if (factor > 1 && nz <= zoom + 0.001f) { Status($"Maximum zoom ({max * 100:0}%)"); return; }
+        float w = p.Width * nz, h = p.Height * nz;
+        float x = hostPt.X - fx * w, y = hostPt.Y - fy * h;
+        zoom = nz;
+        zcx = (videoHost.ClientSize.Width / 2f - x) / w;
+        zcy = (videoHost.ClientSize.Height / 2f - y) / h;
+        LayoutVideo();
         Status(zoom > 1.001f ? $"Zoom {zoom * 100:0}%  ·  drag to move  ·  Z to reset" : "Zoom reset");
     }
 
-    void ZoomCenter(float factor) => ZoomAt(factor, new Point(video.Width / 2, video.Height / 2));
+    void ZoomCenter(float factor) => ZoomAt(factor, new Point(videoHost.ClientSize.Width / 2, videoHost.ClientSize.Height / 2));
 
     void ResetZoom()
     {
         if (zoom <= 1.001f) return;
-        zoom = 1f; ApplyCrop(); Status("Zoom reset");
+        zoom = 1f; LayoutVideo(); Status("Zoom reset");
     }
+
+    void InvalidateZoom() { geoKnown = false; zoom = 1f; LayoutVideo(); }
 
     /// <summary>Catches the mouse wheel over the video wherever Windows delivers it (the video surface is a native window).</summary>
     public bool PreFilterMessage(ref Message m)
@@ -1732,13 +1738,13 @@ libVLC is licensed under the LGPL 2.1.");
         const int WM_MOUSEWHEEL = 0x020A;
         // Checked by cursor position only: if another OmniPlayer window (e.g. the equalizer) has focus,
         // the wheel over the video must still zoom and must NOT also move that window's sliders.
-        if (m.Msg != WM_MOUSEWHEEL || cur == null || !video.Visible || WindowState == FormWindowState.Minimized) return false;
+        if (m.Msg != WM_MOUSEWHEEL || cur == null || !videoHost.Visible || placeholder.Visible || WindowState == FormWindowState.Minimized) return false;
         var screenPt = Cursor.Position;
-        if (!video.RectangleToScreen(video.ClientRectangle).Contains(screenPt)) return false;
+        if (!videoHost.RectangleToScreen(videoHost.ClientRectangle).Contains(screenPt)) return false;
         if (!Geometry()) return false;
         int delta = (short)((long)m.WParam >> 16);
         if (delta == 0) return false;
-        ZoomAt((float)Math.Pow(1.2, delta / 120.0), video.PointToClient(screenPt));
+        ZoomAt((float)Math.Pow(1.2, delta / 120.0), videoHost.PointToClient(screenPt));
         return true;
     }
 
