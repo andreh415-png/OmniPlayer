@@ -40,6 +40,12 @@ static class Program
         Application.ThreadException += (s, e) => Fatal("UI thread", e.Exception);
         AppDomain.CurrentDomain.UnhandledException += (s, e) => Fatal("background thread", e.ExceptionObject as Exception);
 
+        if (!SingleInstance.IsFirst())
+        {
+            Log.Write("Already running — handing files to the open window");
+            if (SingleInstance.SendToRunning(args)) return;
+        }
+
         try
         {
             Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
@@ -62,9 +68,16 @@ static class Program
 
             Log.Write("Creating window…");
             var form = new MainForm(args);
-            form.Shown += (s, e) => Log.Write("Window shown — startup OK");
+            form.Shown += (s, e) =>
+            {
+                Log.Write("Window shown — startup OK");
+                SingleInstance.Listen(form);
+                try { if (!FileAssoc.IsCurrent()) FileAssoc.Register(MainForm.AssociableExtensions); }
+                catch (Exception ex) { Log.Write("File registration: " + ex.Message); }
+            };
             Application.Run(form);
             Log.Write("Exited normally");
+            SingleInstance.KeepAlive();
         }
         catch (Exception ex)
         {

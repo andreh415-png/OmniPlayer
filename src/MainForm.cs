@@ -25,7 +25,7 @@ sealed class Item
 
 sealed class MainForm : Form
 {
-    static readonly HashSet<string> MediaExt = new(StringComparer.OrdinalIgnoreCase)
+    internal static readonly HashSet<string> MediaExt = new(StringComparer.OrdinalIgnoreCase)
     {
         // video
         ".mp4",".m4v",".mkv",".webm",".mov",".avi",".wmv",".asf",".flv",".f4v",".mpg",".mpeg",".mpe",".m1v",".m2v",
@@ -37,6 +37,9 @@ sealed class MainForm : Form
     };
     static readonly HashSet<string> SubExt = new(StringComparer.OrdinalIgnoreCase) { ".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".smi", ".sami", ".txt" };
     static readonly HashSet<string> ListExt = new(StringComparer.OrdinalIgnoreCase) { ".m3u", ".m3u8" };
+    /// <summary>Types offered to Windows for "Open with" / Default apps (skips ambiguous ones like .ts, .it).</summary>
+    internal static IEnumerable<string> AssociableExtensions =>
+        MediaExt.Concat(ListExt).Where(e => e is not (".ts" or ".it" or ".mod" or ".xm" or ".s3m" or ".264" or ".265" or ".y4m" or ".nut" or ".tp"));
     static readonly float[] Rates = { 0.25f, 0.5f, 0.75f, 1f, 1.25f, 1.5f, 1.75f, 2f, 2.5f, 3f, 4f };
     static readonly (string Label, string Value)[] Aspects =
     {
@@ -84,6 +87,7 @@ sealed class MainForm : Form
     DateTime lastPosSave = DateTime.MinValue, lastMove = DateTime.Now, statusUntil = DateTime.MinValue;
     Point lastMouse;
     FormWindowState prevState;
+    DateTime lastExternalOpen = DateTime.MinValue;
     EqualizerForm eqForm;
     Equalizer eq;
 
@@ -139,7 +143,7 @@ sealed class MainForm : Form
             if (S.Maximized) WindowState = FormWindowState.Maximized;
             ApplySplit();
             RenderList(true);
-            if (startup.Count > 0) AddPaths(startup);
+            if (startup.Count > 0) { lastExternalOpen = DateTime.Now; AddPaths(startup); }
             else if (queued != null) Status($"Press Space to continue: {queued.Name}", 8000);
             ProbeDurations();
         };
@@ -405,6 +409,8 @@ sealed class MainForm : Form
         {
             miPlaylist, new ToolStripSeparator(), miResume, miRestore,
             MI("Forget Saved Positions", "", () => { S.Positions.Clear(); Status("Saved positions cleared"); }),
+            new ToolStripSeparator(), MI("Make OmniPlayer My Default Player…", "", MakeDefault),
+            MI("Remove from Windows File Associations…", "", RemoveRegistration),
             new ToolStripSeparator(), MI("Reset Settings to Defaults…", "", ResetSettings)
         });
 
@@ -530,7 +536,7 @@ sealed class MainForm : Form
     }
 
     /// <summary>Adds files/folders/URLs to the playlist and starts playing the first new item.</summary>
-    void AddPaths(IEnumerable<string> paths)
+    void AddPaths(IEnumerable<string> paths, bool play = true)
     {
         var media = new List<string>();
         var subs = new List<string>();
@@ -543,7 +549,7 @@ sealed class MainForm : Form
         if (added.Count == 0 && subs.Count == 0) { Status("No playable files found"); return; }
         if (added.Count > 0) Status($"Added {added.Count} file{(added.Count == 1 ? "" : "s")}");
 
-        if (added.Count > 0)
+        if (added.Count > 0 && (play || cur == null))
         {
             if (cur != null) hist.Add(cur);
             PlayItem(added[0]);
@@ -1416,6 +1422,40 @@ Settings are stored in:
   %AppData%\OmniPlayer\settings.json
 
 libVLC is licensed under the LGPL 2.1.");
+    }
+
+    /// <summary>Files handed over by a second launch (e.g. double-clicking a video while OmniPlayer is open).</summary>
+    public void ReceiveArgs(string[] args)
+    {
+        if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+        Activate();
+        var paths = args.Where(a => IsUrl(a) || File.Exists(a) || Directory.Exists(a)).ToList();
+        if (paths.Count == 0) return;
+        // Selecting several files and pressing Enter launches one copy per file: play the first, queue the rest.
+        bool play = (DateTime.Now - lastExternalOpen).TotalSeconds > 2;
+        lastExternalOpen = DateTime.Now;
+        AddPaths(paths, play);
+    }
+
+    void MakeDefault()
+    {
+        try { FileAssoc.Register(AssociableExtensions); }
+        catch (Exception ex) { MessageBox.Show(this, "Couldn't register with Windows:\n\n" + ex.Message, "OmniPlayer", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+        MessageBox.Show(this,
+            "Windows will now open Settings → Default apps on OmniPlayer's page.\n\n" +
+            "Click \"Set default\" at the top to use OmniPlayer for all its file types,\n" +
+            "or pick individual types (.mp4, .mkv, .mp3 …) from the list below it.\n\n" +
+            "(Windows requires you to confirm this yourself — apps can't change defaults on their own.)",
+            "Make OmniPlayer your default player", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        FileAssoc.OpenDefaultAppsSettings();
+    }
+
+    void RemoveRegistration()
+    {
+        if (MessageBox.Show(this, "Remove OmniPlayer from Windows \"Open with\" and Default apps?\n\n(Files currently set to open with OmniPlayer will go back to asking.)",
+            "OmniPlayer", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+        FileAssoc.Unregister();
+        Status("Removed from Windows file associations");
     }
 
     // ───────────────────────────── Keyboard ─────────────────────────────
