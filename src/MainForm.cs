@@ -8,6 +8,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Forms;
 using LibVLCSharp.Shared;
+using LibVLCSharp.Shared.Structures;
 using LibVLCSharp.WinForms;
 
 namespace OmniPlayer;
