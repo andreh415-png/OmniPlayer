@@ -104,12 +104,15 @@ sealed class MainForm : Form
         boldFont = new Font("Segoe UI", 9.5f, FontStyle.Bold);
 
         // --audio-visual shows a spectrum for music files; hardware decoding is on by default.
+        Log.Write("Starting video engine…");
         vlc = new LibVLC(false, "--audio-visual=visual", "--effect-list=spectrum", "--no-video-title-show", "--no-snapshot-preview");
         mp = new MediaPlayer(vlc) { EnableHardwareDecoding = true, EnableMouseInput = false, EnableKeyInput = false };
 
+        Log.Write("Video engine ready (libVLC " + vlc.Version + ")");
         BuildUi();
         BuildMenu();
         WireEvents();
+        Log.Write("Interface built");
 
         // Window placement
         if (S.X != int.MinValue)
