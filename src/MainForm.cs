@@ -1678,7 +1678,9 @@ libVLC is licensed under the LGPL 2.1.");
     public bool PreFilterMessage(ref Message m)
     {
         const int WM_MOUSEWHEEL = 0x020A;
-        if (m.Msg != WM_MOUSEWHEEL || cur == null || !video.Visible || !ContainsFocus && Form.ActiveForm != this) return false;
+        // Checked by cursor position only: if another OmniPlayer window (e.g. the equalizer) has focus,
+        // the wheel over the video must still zoom and must NOT also move that window's sliders.
+        if (m.Msg != WM_MOUSEWHEEL || cur == null || !video.Visible || WindowState == FormWindowState.Minimized) return false;
         var screenPt = Cursor.Position;
         if (!video.RectangleToScreen(video.ClientRectangle).Contains(screenPt)) return false;
         if (!VideoSize(out _, out _)) return false;

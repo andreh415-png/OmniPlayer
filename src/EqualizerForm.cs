@@ -93,7 +93,7 @@ sealed class EqualizerForm : Form
     TrackBar MakeBar(int x)
     {
         // Vertical TrackBars put the minimum at the top, so values are stored negated (up = boost).
-        var t = new TrackBar { Orientation = Orientation.Vertical, Minimum = -20, Maximum = 20, TickFrequency = 5, SmallChange = 1, LargeChange = 3, Left = x + 4, Top = 70, Height = 200, Width = 45, BackColor = Theme.Panel, TickStyle = TickStyle.Both };
+        var t = new NoWheelTrackBar { Orientation = Orientation.Vertical, Minimum = -20, Maximum = 20, TickFrequency = 5, SmallChange = 1, LargeChange = 3, Left = x + 4, Top = 70, Height = 200, Width = 45, BackColor = Theme.Panel, TickStyle = TickStyle.Both };
         Controls.Add(t); return t;
     }
 
@@ -142,5 +142,16 @@ sealed class EqualizerForm : Form
     {
         if (e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); }
         base.OnFormClosing(e);
+    }
+}
+
+/// <summary>TrackBar that ignores the mouse wheel, so scrolling elsewhere never nudges an EQ band.</summary>
+sealed class NoWheelTrackBar : TrackBar
+{
+    protected override void WndProc(ref Message m)
+    {
+        const int WM_MOUSEWHEEL = 0x020A;
+        if (m.Msg == WM_MOUSEWHEEL) return;   // swallow: the native slider would otherwise move
+        base.WndProc(ref m);
     }
 }
