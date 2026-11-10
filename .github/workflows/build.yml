@@ -8,6 +8,11 @@ on:
 permissions:
   contents: write
 
+# One build at a time; a newer push cancels an older in-progress build so releases never collide.
+concurrency:
+  group: release
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-latest
