@@ -23,6 +23,7 @@ Every push to `main` rebuilds the app automatically (see the **Actions** tab).
 - Speed 0.25×–4×, A–B loop, frame step, jump to time / percent
 - Resume where you left off in long files
 - Snapshots to `Pictures\OmniPlayer`
+- **Zoom like a photo viewer**: mouse wheel zooms at the cursor (up to 10×), drag to move around, Z resets
 - Fullscreen with auto-hiding controls, aspect-ratio override, always-on-top
 - Volume up to 150 %, hardware decoding, spectrum visualizer for music
 - Media info (codec, resolution, frame rate, channels)

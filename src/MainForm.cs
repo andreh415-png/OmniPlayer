@@ -23,7 +23,7 @@ sealed class Item
     public string Name => IsUrl ? Path : System.IO.Path.GetFileName(Path);
 }
 
-sealed class MainForm : Form
+sealed class MainForm : Form, IMessageFilter
 {
     internal static readonly HashSet<string> MediaExt = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -73,6 +73,12 @@ sealed class MainForm : Form
     Font iconFont, iconFontBig, smallBold, boldFont;
     readonly System.Windows.Forms.Timer ui = new() { Interval = 200 };
     readonly System.Windows.Forms.Timer clickTimer = new();
+    readonly System.Windows.Forms.Timer zoomTimer = new() { Interval = 40 };
+
+    // Zoom & pan (picture-viewer style). Implemented with libVLC crop geometry, so it costs nothing extra to decode.
+    float zoom = 1f, zcx = 0.5f, zcy = 0.5f, panCx, panCy;
+    bool cropDirty, mouseDown, panned;
+    Point downPt;
 
     // State
     readonly List<Item> items = new();
@@ -389,6 +395,8 @@ sealed class MainForm : Form
         videoMenu.DropDownItems.AddRange(new ToolStripItem[]
         {
             MI("Fullscreen", "F / F11", ToggleFullscreen), VideoTrackMenu(), miAspect, new ToolStripSeparator(),
+            MI("Zoom In", "Wheel ↑ / Ctrl+=", () => ZoomCenter(1.25f)), MI("Zoom Out", "Wheel ↓ / Ctrl+−", () => ZoomCenter(0.8f)),
+            MI("Reset Zoom", "Z / middle-click", ResetZoom), new ToolStripSeparator(),
             MI("Take Snapshot", "Shift+S", Snapshot), MI("Open Snapshot Folder", "", () => OpenFolderInExplorer(SnapshotDir())),
             new ToolStripSeparator(), miOnTop
         });
@@ -465,7 +473,36 @@ sealed class MainForm : Form
         // Video clicks: single = play/pause, double = fullscreen
         clickTimer.Interval = SystemInformation.DoubleClickTime;
         clickTimer.Tick += (s, e) => { clickTimer.Stop(); TogglePlay(); };
-        video.MouseClick += (s, e) => { if (e.Button == MouseButtons.Left) { clickTimer.Stop(); clickTimer.Start(); } };
+        // Left click = play/pause (unless it turned into a drag); drag while zoomed = pan; middle click = reset zoom
+        video.MouseDown += (s, e) =>
+        {
+            if (e.Button == MouseButtons.Middle) { ResetZoom(); return; }
+            if (e.Button != MouseButtons.Left) return;
+            mouseDown = true; panned = false; downPt = e.Location; panCx = zcx; panCy = zcy;
+        };
+        video.MouseMove += (s, e) =>
+        {
+            if (!mouseDown || zoom <= 1f) return;
+            int dx = e.X - downPt.X, dy = e.Y - downPt.Y;
+            if (!panned && Math.Abs(dx) + Math.Abs(dy) < 5) return;
+            if (!VideoSize(out var w, out var h)) return;
+            panned = true;
+            var r = DisplayRect(w, h);
+            zcx = panCx - dx / r.Width / zoom;
+            zcy = panCy - dy / r.Height / zoom;
+            ClampCenter();
+            cropDirty = true;
+        };
+        video.MouseUp += (s, e) =>
+        {
+            if (e.Button != MouseButtons.Left || !mouseDown) return;
+            mouseDown = false;
+            if (panned) { panned = false; ApplyCrop(); return; }
+            clickTimer.Stop(); clickTimer.Start();
+        };
+        zoomTimer.Tick += (s, e) => { if (cropDirty) { cropDirty = false; ApplyCrop(); } };
+        zoomTimer.Start();
+        Application.AddMessageFilter(this);
         video.MouseDoubleClick += (s, e) => { if (e.Button == MouseButtons.Left) { clickTimer.Stop(); ToggleFullscreen(); } };
         placeholder.Click += (s, e) => { if (items.Count == 0) OpenFiles(); else TogglePlay(); };
 
@@ -793,6 +830,8 @@ sealed class MainForm : Form
         var prev = cur;
         cur = it; queued = null;
         abA = abB = -1; resumePending = true; lastSpu = -1;
+        zoom = 1f; zcx = zcy = 0.5f; cropDirty = false; video.Cursor = Cursors.Default;
+        try { mp.CropGeometry = null; } catch { }
         Media media;
         try
         {
@@ -1393,6 +1432,9 @@ VIDEO & SUBTITLES
   F / F11 / dbl-click  Fullscreen   (Esc exits)
   C                  Subtitles on / off
   G / H              Subtitle delay −/+ 100 ms
+  Mouse wheel        Zoom in / out at the cursor (up to 10×)
+  Drag (zoomed)      Move around the zoomed picture
+  Ctrl + = / −       Zoom in / out      Z or middle-click  Reset zoom
   Shift + S          Snapshot → Pictures\OmniPlayer
   I                  Media info (codecs, resolution)
 
@@ -1526,6 +1568,9 @@ libVLC is licensed under the LGPL 2.1.");
             case Keys.Control | Keys.L: TogglePlaylist(); return true;
             case Keys.Control | Keys.T: JumpToTime(); return true;
             case Keys.F1: ShowShortcuts(); return true;
+            case Keys.Control | Keys.Oemplus: case Keys.Add: ZoomCenter(1.25f); return true;
+            case Keys.Control | Keys.OemMinus: case Keys.Subtract: ZoomCenter(0.8f); return true;
+            case Keys.Z: ResetZoom(); return true;
         }
         if (k >= Keys.D0 && k <= Keys.D9) { JumpPercent(k - Keys.D0); return true; }
         if (k >= Keys.NumPad0 && k <= Keys.NumPad9) { JumpPercent(k - Keys.NumPad0); return true; }
@@ -1555,9 +1600,88 @@ libVLC is licensed under the LGPL 2.1.");
         try { mp.Stop(); } catch { }
     }
 
+    // ───────────────────────────── Zoom & pan ─────────────────────────────
+
+    bool VideoSize(out uint w, out uint h)
+    {
+        w = h = 0;
+        if (cur == null) return false;
+        try { return mp.Size(0, ref w, ref h) && w > 0 && h > 0; } catch { return false; }
+    }
+
+    /// <summary>Where the (letterboxed) picture sits inside the video panel.</summary>
+    RectangleF DisplayRect(uint w, uint h)
+    {
+        float vw = Math.Max(1, video.Width), vh = Math.Max(1, video.Height);
+        float sc = Math.Min(vw / w, vh / h);
+        float dw = w * sc, dh = h * sc;
+        return new RectangleF((vw - dw) / 2, (vh - dh) / 2, dw, dh);
+    }
+
+    void ClampCenter()
+    {
+        float half = 0.5f / zoom;
+        zcx = Math.Clamp(zcx, half, 1 - half);
+        zcy = Math.Clamp(zcy, half, 1 - half);
+    }
+
+    void ApplyCrop()
+    {
+        try
+        {
+            if (zoom <= 1.001f) { zoom = 1f; zcx = zcy = 0.5f; mp.CropGeometry = null; video.Cursor = Cursors.Default; return; }
+            if (!VideoSize(out var w, out var h)) return;
+            ClampCenter();
+            int cw = Math.Max(16, (int)(w / zoom)), ch = Math.Max(16, (int)(h / zoom));
+            int x = (int)Math.Clamp(zcx * w - cw / 2f, 0, w - cw);
+            int y = (int)Math.Clamp(zcy * h - ch / 2f, 0, h - ch);
+            mp.CropGeometry = $"{cw}x{ch}+{x}+{y}";
+            video.Cursor = Cursors.SizeAll;
+        }
+        catch (Exception ex) { Log.Write("Zoom: " + ex.Message); }
+    }
+
+    /// <summary>Zooms by <paramref name="factor"/> keeping the point under <paramref name="at"/> fixed, like a photo viewer.</summary>
+    void ZoomAt(float factor, Point at)
+    {
+        if (!VideoSize(out var w, out var h)) { Status("Zoom works on videos"); return; }
+        ClampCenter();
+        var r = DisplayRect(w, h);
+        float fx = Math.Clamp((at.X - r.X) / r.Width, 0, 1), fy = Math.Clamp((at.Y - r.Y) / r.Height, 0, 1);
+        float px = zcx - 0.5f / zoom + fx / zoom, py = zcy - 0.5f / zoom + fy / zoom;   // frame point under the cursor
+        zoom = Math.Clamp(zoom * factor, 1f, 10f);
+        zcx = px - fx / zoom + 0.5f / zoom;
+        zcy = py - fy / zoom + 0.5f / zoom;
+        ApplyCrop();
+        Status(zoom > 1.001f ? $"Zoom {zoom * 100:0}%  ·  drag to move  ·  Z to reset" : "Zoom reset");
+    }
+
+    void ZoomCenter(float factor) => ZoomAt(factor, new Point(video.Width / 2, video.Height / 2));
+
+    void ResetZoom()
+    {
+        if (zoom <= 1.001f) return;
+        zoom = 1f; ApplyCrop(); Status("Zoom reset");
+    }
+
+    /// <summary>Catches the mouse wheel over the video wherever Windows delivers it (the video surface is a native window).</summary>
+    public bool PreFilterMessage(ref Message m)
+    {
+        const int WM_MOUSEWHEEL = 0x020A;
+        if (m.Msg != WM_MOUSEWHEEL || cur == null || !video.Visible || !ContainsFocus && Form.ActiveForm != this) return false;
+        var screenPt = Cursor.Position;
+        if (!video.RectangleToScreen(video.ClientRectangle).Contains(screenPt)) return false;
+        if (!VideoSize(out _, out _)) return false;
+        int delta = (short)((long)m.WParam >> 16);
+        if (delta == 0) return false;
+        ZoomAt((float)Math.Pow(1.2, delta / 120.0), video.PointToClient(screenPt));
+        return true;
+    }
+
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         base.OnFormClosed(e);
+        Application.RemoveMessageFilter(this);
         try { video.MediaPlayer = null; mp.Dispose(); vlc.Dispose(); } catch { }
     }
 
