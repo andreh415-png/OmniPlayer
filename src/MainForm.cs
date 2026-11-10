@@ -78,6 +78,7 @@ sealed class MainForm : Form, IMessageFilter
     // Zoom & pan (picture-viewer style). Implemented with libVLC crop geometry, so it costs nothing extra to decode.
     float zoom = 1f, zcx = 0.5f, zcy = 0.5f, panCx, panCy;
     bool cropDirty, mouseDown, panned;
+    uint fullW, fullH;   // full-frame size, captured before any crop (libVLC reports the cropped size once zoomed)
     Point downPt;
 
     // State
@@ -830,7 +831,7 @@ sealed class MainForm : Form, IMessageFilter
         var prev = cur;
         cur = it; queued = null;
         abA = abB = -1; resumePending = true; lastSpu = -1;
-        zoom = 1f; zcx = zcy = 0.5f; cropDirty = false; video.Cursor = Cursors.Default;
+        zoom = 1f; zcx = zcy = 0.5f; cropDirty = false; fullW = fullH = 0; video.Cursor = Cursors.Default;
         try { mp.CropGeometry = null; } catch { }
         Media media;
         try
@@ -1606,7 +1607,14 @@ libVLC is licensed under the LGPL 2.1.");
     {
         w = h = 0;
         if (cur == null) return false;
-        try { return mp.Size(0, ref w, ref h) && w > 0 && h > 0; } catch { return false; }
+        if (fullW > 0 && fullH > 0) { w = fullW; h = fullH; return true; }
+        if (zoom > 1.001f) return false;                       // never measure while cropped
+        try
+        {
+            if (mp.Size(0, ref w, ref h) && w > 0 && h > 0) { fullW = w; fullH = h; Log.Write($"Zoom: full frame {w}x{h}"); return true; }
+        }
+        catch { }
+        return false;
     }
 
     /// <summary>Where the (letterboxed) picture sits inside the video panel.</summary>
@@ -1635,7 +1643,9 @@ libVLC is licensed under the LGPL 2.1.");
             int cw = Math.Max(16, (int)(w / zoom)), ch = Math.Max(16, (int)(h / zoom));
             int x = (int)Math.Clamp(zcx * w - cw / 2f, 0, w - cw);
             int y = (int)Math.Clamp(zcy * h - ch / 2f, 0, h - ch);
-            mp.CropGeometry = $"{cw}x{ch}+{x}+{y}";
+            string geo = $"{cw}x{ch}+{x}+{y}";
+            mp.CropGeometry = geo;
+            Log.Write($"Zoom {zoom:0.00}x → crop {geo}");
             video.Cursor = Cursors.SizeAll;
         }
         catch (Exception ex) { Log.Write("Zoom: " + ex.Message); }
