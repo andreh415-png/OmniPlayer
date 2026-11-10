@@ -31,8 +31,9 @@ Every push to `main` rebuilds the app automatically (see the **Actions** tab).
 
 ## Make it your default player
 
-Right-click a video → **Open with → Choose another app → More apps → Look for another app on this PC** → pick `OmniPlayer.exe`,
-and tick **Always use this app**.
+In OmniPlayer, open **View → Make OmniPlayer My Default Player…**. Windows opens Settings → Default apps on
+OmniPlayer's page — click **Set default** (or pick individual file types). Windows requires you to confirm this
+yourself; apps can't change defaults on their own.
 
 ## Build it yourself
 
